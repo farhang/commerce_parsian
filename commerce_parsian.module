@@ -1,0 +1,409 @@
+<?php
+
+/**
+ * @file
+ * Contains Commerce Parsian payment's necessary hooks & callbacks.
+ */
+
+/**
+ * Implements hook_init().
+ */
+function commerce_parsian_init() {
+  // Including nusoap library.
+  $file_path = './' . libraries_get_path('nusoap') . "/nusoap.php";
+  require_once($file_path);
+  //$order = _commerce_parsian_order_get('72374734');
+  //dpr($order);
+  //commerce_order_status_info($order->order_status, 'state');
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_parsian_menu() {
+  $items = array();
+  $items['cart/parsian/complete'] = array(
+    'title' => 'Order payment complete',
+    'page callback' => 'commerce_parsian_callback_complete',
+    'access callback' => 'commerce_parsian_callback_complete_access',
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_parsian_commerce_payment_method_info() {
+  // Initializing Parsian payment method information.
+  $payment_methods = array();
+  $payment_methods['commerce_payment_parsian'] = array(
+    'base' => 'commerce_parsian',
+    'title' => t('Parsian Payment'),
+    'description' => t('Parsian payment description.'),
+    'active' => TRUE,
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+function commerce_parsian_settings_form($settings = NULL) {
+  // Creating Parsian gateway's information form.
+  $settings = (array) $settings + array(
+    'merchant' => '',
+    'gatewayuri' => '',
+    'gatewaylandpage' => '',
+  );
+  
+  $form['merchant'] = array(
+  '#type' => 'textfield',
+  '#title' => t("Pin code (Merchant ID)"),
+  '#description' => t('Enter Parsian Merchant ID.'),
+  '#maxlength' => 64,
+  '#required' => TRUE,
+  '#default_value' => $settings['merchant'],
+  );
+  
+  $form['gatewayuri'] = array(
+  '#type' => 'textfield',
+  '#title' => t("Parsian gateway URI"),
+  '#description' => t('Enter Parsian gateway URI.'),
+  '#maxlength' => 128,
+  '#required' => TRUE,
+  '#default_value' => $settings['gatewayuri'],
+  );
+  
+  $form['gatewaylandpage'] = array(
+  '#type' => 'textfield',
+  '#title' => t("Parsian gateway landpage to navigates the users for payment."),
+  '#description' => t('Enter Parsian landpage address.'),
+  '#maxlength' => 64,
+  '#required' => TRUE,
+  '#default_value' => $settings['gatewaylandpage'],
+  );
+  
+  if(!empty($settings)) {
+  $data = array(
+    'merchant' => $settings['gatewaylandpage'],
+    'gatewayuri' => $settings['gatewayuri'],
+    'gatewaylandpage' => $settings['gatewaylandpage'],
+  );
+  variable_get('commerce_parsian_gateway_info', $data);
+  }
+  else {
+    _commerce_parsian_log_error(t("parsian gateway's info not set."));
+    drupal_set_message(t('The information of Parsian gateway not setted, Please set it from <a href="!link">configuration page</a>.',
+    array('!link' => url('admin/commerce/config/payment-methods'))), 'error');
+  }
+  
+  return $form;
+}
+
+/**
+ * Payment method callback: adds a message to the submission form.
+ */
+function commerce_parsian_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form['parsian_information'] = array(
+  '#markup' => '<span class="commerce-parsian-info">' . t('(Continue with checkout to complete payment via Parsian bank.)') . '</span>',
+  );
+  return $form;
+}
+
+/**
+ * Payment method callback: Preparing users to navigate to Parsian's payment page.
+ */  
+function commerce_parsian_redirect_form($form, &$form_state, $order, $payment_method) {
+  global $base_root;
+  // Initializing SOAP parameters.
+  $soap_params = array(
+    'status' => 1,
+    'authority' => 0,
+    'orderId' => $order->order_id,
+    'amount' => intval($order->commerce_order_total['und'][0]['amount']),
+    'callbackUrl' => $base_root . url('cart/parsian/complete'),
+    'pin' => $payment_method['settings']['merchant'],
+  );
+    
+  $soap_results = _commerce_parsian_soap_call($soap_params, 'PinPaymentRequest');
+  //dpm($soap_results);
+  // If connection was successfull and didn't have any problem, gets authority code from Parsian gateway.
+  if (empty($soap_results['authority']) || $soap_results['status'] != 0) {
+    _commerce_parsian_log_error(t('Could not request pin payment. Status: @code',
+    array('@code' => _commerce_parsian_error_translate($soap_results['status']))
+    ));
+  }
+  
+  // Store authority code for future validations.
+  $record = new stdClass();
+  $record->oid = $soap_params['orderId'];
+  $record->authority = $soap_results['authority'];
+  $record->created = time();
+  drupal_write_record('commerce_payment_parsian', $record);
+   
+  //configure Parsian submit to pay's form.
+  $form['#action'] = $payment_method['settings']['gatewaylandpage'] . '?au=' . $soap_results['authority'];;
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to Parsian'),
+  );
+  
+  return $form;
+}
+
+function commerce_parsian_callback_complete($cart_id = 0) {
+  $status = (int) $_REQUEST['rs'];
+  $authority = (int) $_REQUEST['au'];
+  
+  // Checking authority/status availability and validatability.
+  if (!_commerce_parsian_authority_verify($authority) || !isset($status, $authority)) {
+    _commerce_parsian_log_error(t('Could not recieve valid authorities and status codes from Parsian bank. Operation cancelled. not verified'));
+  }
+  
+  // When an order status is not in "checkout" state,
+  // do not validate the payment by sending an enquiry to the bank.
+  $order = _commerce_parsian_order_get($authority);
+  $order_status = commerce_order_status_load($order->status);
+  $order_state = commerce_order_state_load($order_status['state']);
+  //dpm($order_state['name']);
+  if ($order === FALSE /*|| $order_state['name'] != 'checkout'*/  ) {
+    // Delete the orphan failed authority record.
+    _commerce_parsian_authority_delete($authority);
+    _commerce_parsian_log_error(t('The order status is not in checkout. You are not authorized to checkout this order.'));
+  }
+  
+  // Load a payment method instance.
+  $payment_method = commerce_payment_method_instance_load('commerce_payment_parsian|commerce_payment_commerce_payment_parsian');
+  //Parsian payment enquiry.
+  $soap_params = array(
+    'status' => $status,
+    'authority' => $authority,
+    'pin' => $payment_method['settings']['merchant'], 
+  );
+  //dpm('soap params are below.');
+  //dpm($soap_params); 
+  $soap_results = _commerce_parsian_soap_call($soap_params, 'PinPaymentEnquiry');
+  //dpm('soap results are below.');
+  //dpm($soap_results);
+  // Checking SOAP enquiry call results for errors.
+  if ($soap_results['status'] != 0) {
+    // Delete the orphan failed authority record.
+    _commerce_parsian_authority_delete($authority);
+    _commerce_parsian_log_error(t('Could not validate your payment, Enquiry failed. Status: @code',
+      array('@code' => _commerce_parsian_error_translate($soap_results['status']))
+    ));
+  }
+
+  //If we're here, the payment was successfull, Finalize!
+  _commerce_parsian_order_finalize($order, $authority, $cart_id);
+
+}
+
+/**
+ * Finalizes a successfull paid order.
+ *
+ * @param $order
+ *   Order object.
+ * @param $authority
+ *   Payment's valid authority code.
+ * @param $cart_id
+ *   Cart identifier to get emptied.
+ */
+function _commerce_parsian_order_finalize($order, $authority, $cart_id) {
+  // Mark the payment authority record as valid.
+  _commerce_parsian_authority_validate($authority);
+  $payment_method = commerce_payment_method_instance_load('commerce_payment_parsian|commerce_payment_commerce_payment_parsian');
+  $charge  = array (
+    'amount' => $order->commerce_order_total['und'][0]['amount'],
+    'currency_code' => $order->commerce_order_total['und'][0]['currency_code'],
+  );
+  $message = 'Payment was successful';
+  commerce_payment_redirect_pane_next_page($order);
+  _commerce_parsian_transaction($payment_method, $order, $charge, $message, $authority);
+  
+  db_update('commerce_order')
+  ->fields(array('status' => 'completed'))
+  ->condition('order_id', $order->order_id)
+  ->execute();
+  
+  global $user;
+  $path = 'user/' . $user->uid . '/licensed-files';
+  //dpr($user);
+  drupal_goto($path);
+}
+
+/**
+ * Creates an Parisan payment transaction for the specified charge amount.
+ *
+ * @param $payment_method
+ *   The payment method instance object used to charge this payment.
+ * @param $order
+ *   The order object the payment applies to.
+ * @param $charge
+ *   An array indicating the amount and currency code to charge.
+ * @param $name
+ *   The name entered on the submission form.
+ */
+function _commerce_parsian_transaction($payment_method, $order, $charge, $message, $authority) {
+  $transaction = commerce_payment_transaction_new('commerce_payment_parsian', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+  $transaction->message = $message;
+  $transaction->remote_id = $authority;
+
+  commerce_payment_transaction_save($transaction);
+}
+
+/**
+ * Helper function to call a remote SOAP method.  
+ *
+ * @param $soap_params
+ *   SOAP parameters.
+ *
+ * @return
+ *   SOAP call results.
+ */
+function _commerce_parsian_soap_call($soap_params, $soap_method) {
+  // Initializing Parsian gateway data.
+  $payment_method = commerce_payment_method_instance_load('commerce_payment_parsian|commerce_payment_commerce_payment_parsian');
+  $gateway_data = array(
+    'gatewayuri' => $payment_method['settings']['gatewayuri'],
+    'gatewaylandpage' => $payment_method['settings']['gatewaylandpage'],
+  );
+  
+  // Getting a SoapClient instance.
+  $soap_client = new nusoap_client($gateway_data['gatewayuri'], true);
+  
+  // Checking instantiation errors.
+  if ($err = $soap_client->getError()) {
+    _commerce_parsian_log_error(t('Could not connect to Parsian webservice.'));
+  }
+  return $soap_client->call($soap_method, $soap_params);
+}
+
+/**
+ * Helper function to display and log commerce_parsian errors.
+ *
+ * @param $message
+ *   Error message to be logged.
+ * @param $redirect
+ *   Drupal path to redirect after error logging.
+ *   Set to FALSE and disable redirection.
+ */
+function _commerce_parsian_log_error($message, $redirect = 'cart/checkout') {
+  // Display error to the end user.
+  drupal_set_message($message, 'error');
+  // Redirect if necessary.
+  if ($redirect) {
+    drupal_goto($redirect);
+  }
+}
+
+/**
+ * Checks coming authority code to be equal to the local one.
+ *
+ * @param $authority
+ *   Coming authority code to be verified.
+ *
+ * @return
+ *   TRUE or FALSE based on the verification.
+ */
+function _commerce_parsian_authority_verify($authority) {
+  $authority_local = db_query("SELECT COUNT(*) FROM {commerce_payment_parsian} WHERE authority = :authority", array(':authority' =>  $authority))->fetchField();
+  //dpm($authority_local);
+  return (bool) $authority_local;
+}
+
+/**
+ * Validates an authority record.
+ *
+ * Updates an authority record, setting its "status" to 1.
+ *
+ * @param $authority
+ *   Authority code from Parsian payment.
+ * @param $status
+ *   TRUE or FALSE.
+ */
+function _commerce_parsian_authority_validate($authority) {
+  db_update('commerce_payment_parsian')
+  ->fields(array('status' => '1'))
+  ->condition('authority', $authority)
+  ->execute();
+}
+
+/**
+ * Removes an orphan incomplete payment authority record from the database.
+ *
+ * @param $authority
+ *   Authority code from Parsian payment.
+ */
+function _commerce_parsian_authority_delete($authority) {
+  db_delete('commerce_payment_parsian')->condition('authority', $authority)->execute();
+
+}
+
+/**
+ * Gets order identifier by authority code.
+ *
+ * @param $authority
+ *   Authority code from Parsian payment.
+ *
+ * @return
+ *   Order object or FALSE on failure.
+ */
+function _commerce_parsian_order_get($authority) {
+  $oid = db_query("SELECT oid FROM {commerce_payment_parsian} WHERE authority = :authority",array(':authority' =>  $authority))->fetchField();
+  return $oid ? commerce_order_load($oid) : FALSE;
+}
+
+function _commerce_parsian_error_translate($code) {
+  switch ($code) {
+    case 20:
+    case 22:
+      return t('@code - Invalid PIN or IP.', array(
+        '@code' => $code,
+      ));
+
+    case 30:
+      return t('@code - The operation has been done previously.', array(
+        '@code' => $code,
+      ));
+
+    case 34:
+      return t('@code - Invalid transaction number.', array(
+        '@code' => $code,
+      ));
+
+    default:
+      return t('@code - Unknown status code. Refer to your technical documentation or contact Parsian bank support.', array(
+        '@code' => $code,
+      ));
+  }
+}
+
+function commerce_parsian_commerce_currency_info_alter(&$currencies, $langcode) {
+$currencies['IRR'] = array(
+  'code' => '',
+  'numeric_code' => '364',
+  'name' => t('Iranian Rial'),
+  'symbol' => 'ریال',
+  'major_unit' => t('Toman'),
+  'minor_unit' => t('Rial'),
+  'symbol_placement' => 'after',
+  'decimals' => '0',
+);
+//dsm($currencies);
+//$currencies['EUR']['symbol_placement'] = 'before';
+}
+
+/**
+ * Order payment request page access callback.
+ */
+function commerce_parsian_callback_complete_access() {
+  return TRUE;
+}

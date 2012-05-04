@@ -1,0 +1,60 @@
+<?php
+
+/**
+ * @file
+ * Contains Ubercart Parsian payment un/installation hooks.
+ */
+
+/**
+ * Implements hook_schema().
+ */
+function commerce_parsian_schema() {
+  $schema = array();
+
+  $schema['commerce_payment_parsian'] = array(
+    'description' => 'Stores Parsian payment authorities.',
+    'fields' => array(
+      'oid' => array(
+        'description' => 'Order identifier.',
+        'type' => 'int',
+        'length' => 10,
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'authority' => array(
+        'description' => 'Payment authority code.',
+        'type' => 'varchar',
+        'length' => 31,
+        'not null' => TRUE,
+      ),
+      'created' => array(
+        'description' => 'Authority record timestamp.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'status' => array(
+        'description' => 'Payment failed or not.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'indexes' => array(
+      'oid_authority' => array('oid', 'authority'),
+    ),
+  );
+
+  return $schema;
+}
+
+/**
+ * Implements hook_install().
+ */
+function commerce_parsian_enable() {
+  drupal_set_message(t('Commerce Parsian payment has been installed. Please set your settings in <a href="!link">configuration page</a>.',
+    array('!link' => url('admin/commerce/config/payment-methods'))
+  ));
+}
+
